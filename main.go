@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/aws/aws-lambda-go/lambda"
 	"log"
 	"net/url"
 	"strconv"
@@ -16,50 +15,15 @@ import (
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
+	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
 )
 
-var routes = router{
-	{
-		Path:     `/accounts`,
-		Method:   "GET",
-		Callback: listAccounts,
-	},
-	{
-		Path:     `/charges`,
-		Method:   "POST",
-		Callback: createCharge,
-	},
-	{
-		Path:     `/charges`,
-		Method:   "GET",
-		Callback: listCharges,
-	},
-	{
-		Path:     `/charges/(?P<id>[^/]+)`,
-		Method:   "GET",
-		Callback: getCharge,
-	},
-}
-
-var db *sql.DB
-
-func init() {
-	routes.Init()
-
-	var err error
-	db, err = sql.Open(
-		"postgres",
-		"postgresql://globalstripe@globalstripedb.demo.cockroachdb.dev:26257/globalstripe?ssl=true&sslmode=require&password=5B57E9F2-A7E9-46DA-B1D2-448334CC6233")
-	if err != nil {
-		log.Fatal("error connecting to the database: ", err)
-	}
-}
-
 var ParamNotFoundError = errors.New("query parameter not found")
 
-// Request aliases events.ALBTargetGroupRequest.
-type Request events.ALBTargetGroupRequest
+type Request events.APIGatewayProxyRequest
+type Response events.APIGatewayProxyResponse
 
 func (r *Request) IntParameter(name string) (int, error) {
 	param, ok := r.QueryStringParameters[name]
@@ -73,62 +37,44 @@ func (r *Request) IntParameter(name string) (int, error) {
 	return i, nil
 }
 
-// Response aliases events.ALBTargetGroupResponse
-type Response events.ALBTargetGroupResponse
-
 type Account struct {
 	Id        string
 	Email     string
-	CreatedAt time.Time
-}
-
-func (a *Account) FromScan(scan func(dest ...interface{}) error) error {
-	return scan(&a.Id, &a.Email, &a.CreatedAt)
+	CreatedAt time.Time `db:"created_at"`
 }
 
 type Charge struct {
 	Region    string
+	AccountId string    `db:"account_id"`
 	Id        string
 	Amount    float64
 	Currency  string
 	Last4     string
 	Outcome   string
-	AccountId string
-	CreatedAt time.Time
+	CreatedAt time.Time `db:"created_at"`
 }
 
-type Charges []Charge
+var db *sqlx.DB
 
-func (c *Charge) FromScan(scan func(dest ...interface{}) error) error {
-	return scan(
-		&c.Region, &c.Id, &c.Amount, &c.Currency, &c.Last4,
-		&c.Outcome, &c.AccountId, &c.CreatedAt,
-	)
-}
-
-func (c *Charges) FromRows(rows *sql.Rows) {
-	*c = []Charge{}
-	for rows.Next() {
-		var charge Charge
-		if err := charge.FromScan(rows.Scan); err != nil {
-			panic(err)
-		}
-		*c = append(*c, charge)
-	}
-	if err := rows.Err(); err != nil {
-		panic(err)
+func init() {
+	var err error
+	db, err = sqlx.Open(
+		"postgres",
+		"postgresql://globalstripe@globalstripedb.demo.cockroachdb.dev:26257/globalstripe?ssl=true&sslmode=require&password=5B57E9F2-A7E9-46DA-B1D2-448334CC6233")
+	if err != nil {
+		log.Fatal("error connecting to the database: ", err)
 	}
 }
 
 // GET /accounts
-func listAccounts(request Request, _ ...string) Response {
+func listAccounts(request Request) Response {
 	return authenticate(request, func(account Account) Response {
 		return makeResponse(200, account)
 	})
 }
 
 // POST /charges
-func createCharge(request Request, _ ...string) Response {
+func createCharge(request Request) Response {
 	return authenticate(request, func(account Account) Response {
 		values, err := decodePostBody(request)
 		if err != nil {
@@ -156,15 +102,13 @@ func createCharge(request Request, _ ...string) Response {
 		amount := values.Get("amount")
 		currency := values.Get("currency")
 
+		var charge Charge
 		text :=
 			"INSERT INTO charges " +
-			"(amount, currency, last4, outcome, account_id, created_at) " +
-			"VALUES ($1, $2, $3, $4, $5, current_timestamp()) " +
-			"RETURNING region, id, amount, currency, last4, outcome, account_id, created_at"
-		row := db.QueryRow(text, amount, currency, last4, outcome, account.Id)
-
-		var charge Charge
-		if err = charge.FromScan(row.Scan); err != nil {
+				"(amount, currency, last4, outcome, account_id, created_at) " +
+				"VALUES ($1, $2, $3, $4, $5, current_timestamp()) " +
+				"RETURNING region, id, amount, currency, last4, outcome, account_id, created_at"
+		if err = db.Get(&charge, text, amount, currency, last4, outcome, account.Id); err != nil {
 			return badRequestResponse(fmt.Sprintf("invalid post data: %v", err))
 		}
 
@@ -173,7 +117,7 @@ func createCharge(request Request, _ ...string) Response {
 }
 
 // GET /charges
-func listCharges(request Request, _ ...string) Response {
+func listCharges(request Request) Response {
 	return authenticate(request, func(account Account) Response {
 		limit, err := request.IntParameter("limit")
 		if err == ParamNotFoundError {
@@ -182,38 +126,32 @@ func listCharges(request Request, _ ...string) Response {
 			return badRequestResponse("limit must be an integer")
 		}
 
+		var charges []Charge
 		text :=
 			"SELECT region, id, amount, currency, last4, outcome, account_id, created_at " +
-			"FROM charges " +
-			"WHERE account_id = $1 " +
-			"ORDER BY created_at DESC " +
-			"LIMIT $2"
-		rows, err := db.Query(text, account.Id, limit)
-		if err != nil {
+				"FROM charges " +
+				"WHERE account_id = $1 " +
+				"ORDER BY created_at DESC " +
+				"LIMIT $2"
+		if err := db.Select(&charges, text, account.Id, limit); err != nil {
 			panic(err)
 		}
-		defer rows.Close()
-
-		var charges Charges
-		charges.FromRows(rows)
 		return makeResponse(200, charges)
 	})
 }
 
 // GET /charges/{id}
-func getCharge(request Request, pathMatches ...string) Response {
+func getCharge(request Request) Response {
 	return authenticate(request, func(account Account) Response {
-		id := pathMatches[0]
+		id := request.PathParameters["id"]
 
 		// Start by assuming charge is in the current region, for fast lookup.
 		var charge Charge
 		text :=
 			"SELECT region, id, amount, currency, last4, outcome, account_id, created_at " +
-			"FROM charges " +
-			"WHERE region = crdb_internal.locality_value('region') AND id = $1 AND account_id = $2"
-		row := db.QueryRow(text, id, account.Id)
-		err := charge.FromScan(row.Scan)
-		if err == nil {
+				"FROM charges " +
+				"WHERE region = crdb_internal.locality_value('region') AND id = $1 AND account_id = $2"
+		if err := db.Get(&charge, text, id, account.Id); err == nil {
 			return makeResponse(200, charge)
 		} else if err != sql.ErrNoRows {
 			panic(err)
@@ -221,11 +159,9 @@ func getCharge(request Request, pathMatches ...string) Response {
 
 		text =
 			"SELECT region, id, amount, currency, last4, outcome, account_id, created_at " +
-			"FROM charges " +
-			"WHERE id = $1 AND account_id = $2"
-		row = db.QueryRow(text, id, account.Id)
-		err = charge.FromScan(row.Scan)
-		if err == nil {
+				"FROM charges " +
+				"WHERE id = $1 AND account_id = $2"
+		if err := db.Get(&charge, text, id, account.Id); err == nil {
 			return makeResponse(200, charge)
 		} else if err != sql.ErrNoRows {
 			panic(err)
@@ -236,7 +172,7 @@ func getCharge(request Request, pathMatches ...string) Response {
 }
 
 func authenticate(request Request, fn func(account Account) Response) Response {
-	auth, ok := request.Headers["authorization"]
+	auth, ok := request.Headers["Authorization"]
 	if !ok {
 		return accessDeniedResponse("no secret key was supplied")
 	}
@@ -251,8 +187,7 @@ func authenticate(request Request, fn func(account Account) Response) Response {
 
 	var account Account
 	text := "SELECT id, email, created_at FROM accounts WHERE secret_key_digest = $1"
-	row := db.QueryRow(text, secret_key_digest)
-	if err := account.FromScan(row.Scan); err != nil {
+	if err := db.Get(&account, text, secret_key_digest); err != nil {
 		return accessDeniedResponse("secret key does not match any account")
 	}
 
@@ -260,31 +195,11 @@ func authenticate(request Request, fn func(account Account) Response) Response {
 }
 
 func decodePostBody(request Request) (values url.Values, err error) {
-	body, err := base64.URLEncoding.DecodeString(request.Body)
-	if err != nil {
-		return nil, fmt.Errorf("post body cannot be decoded: %v", err)
-	}
-
-	values, err = url.ParseQuery(string(body))
+	values, err = url.ParseQuery(request.Body)
 	if err != nil {
 		err = fmt.Errorf("error parsing post body: %v", err)
 	}
 	return values, err
-}
-
-func makeResponse(status int, val interface{}) Response {
-	var buf bytes.Buffer
-	body, err := json.Marshal(val)
-	if err != nil {
-		panic(err)
-	}
-	json.HTMLEscape(&buf, body)
-	return Response{
-		StatusCode:      status,
-		IsBase64Encoded: false,
-		Body:            buf.String(),
-		Headers: map[string]string{"Content-Type": "application/json"},
-	}
 }
 
 func accessDeniedResponse(reason string) Response {
@@ -299,11 +214,50 @@ func notFoundResponse(reason string) Response {
 	return makeResponse(404, fmt.Sprintf("404 (Not Found): %s", reason))
 }
 
-// handleRequest is our lambda handler invoked by the `lambda.Start` function call
-func handleRequest(request Request) (response Response, err error) {
-	return routes.RouteRequest(request), nil
+// Handler is our lambda handler invoked by the `lambda.Start` function call
+func Handler(request Request) (Response, error) {
+	switch request.HTTPMethod {
+	case "GET":
+		switch request.Resource {
+		case "/accounts":
+			return listAccounts(request), nil
+
+		case "/charges":
+			return listCharges(request), nil
+
+		case "/charges/{id}":
+			return getCharge(request), nil
+		}
+
+	case "POST":
+		switch request.Resource {
+		case "/charges":
+			return createCharge(request), nil
+		}
+
+	default:
+		log.Fatal("unknown method")
+	}
+
+	log.Fatal("unknown resource")
+	return Response{}, nil
+}
+
+func makeResponse(status int, val interface{}) Response {
+	var buf bytes.Buffer
+	body, err := json.Marshal(val)
+	if err != nil {
+		log.Fatal(err)
+	}
+	json.HTMLEscape(&buf, body)
+	return Response{
+		StatusCode:      status,
+		IsBase64Encoded: false,
+		Body:            buf.String(),
+		Headers: map[string]string{"Content-Type": "application/json"},
+	}
 }
 
 func main() {
-	lambda.Start(handleRequest)
+	lambda.Start(Handler)
 }
